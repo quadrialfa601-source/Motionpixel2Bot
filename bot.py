@@ -2,7 +2,9 @@ import os
 import time
 import logging
 import asyncio
+import subprocess
 
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,8 +14,8 @@ from telegram.ext import (
     filters,
 )
 
-from google import genai
-from google.genai import types
+import fal_client
+from gtts import gTTS
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -26,15 +28,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-VEO_MODEL = os.getenv("VEO_MODEL", "veo-3.1-fast-generate-preview")
+FAL_KEY = os.getenv("FAL_KEY")
+FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/kling-video/v1.6/standard/image-to-video")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+if not FAL_KEY:
+    raise RuntimeError("FAL_KEY environment variable is not set")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# fal_client reads the FAL_KEY environment variable automatically,
+# but we double check it's set above so the bot fails fast with a clear error.
 
 # ---------------------------------------------------------------------------
 # Telegram handlers
@@ -43,18 +46,22 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I'm MotionPixel \U0001F4F8\u2192\U0001F3AC\n\n"
-        "Send me a photo WITH A CAPTION describing how you want it animated.\n"
-        "Example: send a photo of a lake, caption it 'gentle waves and birds flying over the water'.\n\n"
+        "Send me a photo WITH A CAPTION. The caption will be used as:\n"
+        "1) A short motion description for the video, and\n"
+        "2) The narration the video will 'say' out loud.\n\n"
+        "Keep captions short and clear, e.g. 'Water is essential for human health "
+        "and helps every cell in the body function properly.'\n\n"
         "Generation usually takes 1-2 minutes, so please be patient after sending."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Just send a photo with a caption (your animation prompt) and I'll turn it into a short video.\n\n"
-        "Tips for good prompts:\n"
-        "- Describe motion, not just the scene (e.g. 'waves rolling in slowly')\n"
-        "- Keep it to one clear action\n"
+        "Send a photo with a caption. The caption becomes the spoken narration AND "
+        "the motion prompt for the video.\n\n"
+        "Tips:\n"
+        "- Keep it to 1-2 short sentences (clips are only a few seconds long)\n"
+        "- Clear, simple language works best for narration\n"
         "- Avoid text/logos in the source image, results are less reliable"
     )
 
@@ -65,8 +72,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not prompt:
         await message.reply_text(
-            "Please resend the photo WITH a caption describing the motion you want "
-            "(the caption is used as your prompt)."
+            "Please resend the photo WITH a caption — that caption becomes both "
+            "the narration and the motion prompt."
         )
         return
 
@@ -79,7 +86,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await photo.get_file()
         image_bytes = bytes(await tg_file.download_as_bytearray())
 
-        video_path = await generate_video_from_image(image_bytes, prompt)
+        video_path = await generate_talking_video(image_bytes, prompt)
 
         with open(video_path, "rb") as video_file:
             await message.reply_video(video=video_file, caption=f"Prompt: {prompt}")
@@ -96,49 +103,89 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Please send a photo with a caption describing the motion you want, not just text. "
-        "Use /help for tips."
+        "Please send a photo with a caption, not just text. Use /help for tips."
     )
 
 
 # ---------------------------------------------------------------------------
-# Gemini / Veo video generation
+# Video generation (fal.ai / Kling) + narration (gTTS) + merge (ffmpeg)
 # ---------------------------------------------------------------------------
 
-async def generate_video_from_image(image_bytes: bytes, prompt: str) -> str:
+async def generate_talking_video(image_bytes: bytes, prompt: str) -> str:
     """
-    Calls the Gemini API (Veo) to generate a video from an image + text prompt.
-    The Gemini SDK calls are blocking, so they run in a background thread
-    to avoid freezing the bot while polling for the result.
+    Full pipeline:
+    1. Upload the image to fal.ai and generate a short silent video (motion).
+    2. Generate narration audio from the prompt text (gTTS).
+    3. Merge the audio onto the video with ffmpeg.
+    Runs the blocking work in a background thread so the bot stays responsive.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _generate_video_blocking, image_bytes, prompt)
+    return await loop.run_in_executor(None, _generate_talking_video_blocking, image_bytes, prompt)
 
 
-def _generate_video_blocking(image_bytes: bytes, prompt: str) -> str:
-    image = types.Image(image_bytes=image_bytes, mime_type="image/jpeg")
+def _generate_talking_video_blocking(image_bytes: bytes, prompt: str) -> str:
+    ts = int(time.time())
 
-    operation = gemini_client.models.generate_videos(
-        model=VEO_MODEL,
-        prompt=prompt,
-        image=image,
-        config=types.GenerateVideosConfig(
-            number_of_videos=1,
-        ),
+    # 1. Save and upload the source image
+    input_image_path = f"/tmp/input_{ts}.jpg"
+    with open(input_image_path, "wb") as f:
+        f.write(image_bytes)
+
+    image_url = fal_client.upload_file(input_image_path)
+
+    # 2. Generate the silent motion video via fal.ai (Kling)
+    result = fal_client.subscribe(
+        FAL_MODEL,
+        arguments={
+            "prompt": prompt,
+            "image_url": image_url,
+        },
+        with_logs=False,
     )
 
-    # Poll until the generation job finishes
-    while not operation.done:
-        time.sleep(10)
-        operation = gemini_client.operations.get(operation)
+    video_remote_url = result["video"]["url"]
 
-    if operation.response is None or not operation.response.generated_videos:
-        raise RuntimeError("No video was returned by the API")
+    raw_video_path = f"/tmp/raw_{ts}.mp4"
+    _download_file(video_remote_url, raw_video_path)
 
-    generated_video = operation.response.generated_videos[0]
-    output_path = f"/tmp/video_{int(time.time())}.mp4"
-    generated_video.video.save(output_path)
-    return output_path
+    # 3. Generate narration audio from the same prompt text
+    narration_path = f"/tmp/narration_{ts}.mp3"
+    tts = gTTS(text=prompt, lang="en")
+    tts.save(narration_path)
+
+    # 4. Merge narration onto the video with ffmpeg
+    #    -shortest trims to whichever is shorter (video is usually ~5s,
+    #    so keep captions short or the narration will get cut off)
+    final_path = f"/tmp/final_{ts}.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", raw_video_path,
+            "-i", narration_path,
+            "-c:v", "copy",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
+            final_path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    # Clean up intermediate files
+    for p in (input_image_path, raw_video_path, narration_path):
+        if os.path.exists(p):
+            os.remove(p)
+
+    return final_path
+
+
+def _download_file(url: str, dest_path: str):
+    response = requests.get(url, stream=True, timeout=120)
+    response.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
 
 
 # ---------------------------------------------------------------------------
