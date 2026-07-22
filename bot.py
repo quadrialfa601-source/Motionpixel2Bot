@@ -35,7 +35,7 @@ if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
 
 # Create the Space client once at startup (reused across requests)
-gradio_client = Client(HF_SPACE_ID, hf_token=HF_TOKEN) if HF_TOKEN else Client(HF_SPACE_ID)
+gradio_client = Client(HF_SPACE_ID, token=HF_TOKEN) if HF_TOKEN else Client(HF_SPACE_ID)
 
 # ---------------------------------------------------------------------------
 # Telegram handlers
